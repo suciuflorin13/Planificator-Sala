@@ -1,0 +1,8 @@
+{
+  "deno.enablePaths": ["supabase/functions"],
+  "deno.importMap": "./supabase/functions/deno.json",
+  "deno.unstable": ["kv", "cron", "broadcast-channel"],
+  "[typescript]": {
+    "editor.defaultFormatter": "denoland.vscode-deno"
+  }
+}
