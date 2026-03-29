@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../data/repositories.dart';
 import '../../domain/enums.dart';
 import '../../domain/models.dart';
+import '../helpers/status_dialog_helper.dart';
 import '../theme.dart';
 
 class UsersPage extends StatefulWidget {
@@ -63,8 +64,11 @@ class _UsersPageState extends State<UsersPage> {
 
   Future<void> _updateRole(String userId, String newRole) async {
     if (!_canChangeRole(userId, newRole)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Nu ai permisiunea pentru această acțiune.')),
+      await StatusDialogHelper.show(
+        context,
+        title: 'Permisiune refuzată',
+        message: 'Nu ai permisiunea pentru această acțiune.',
+        isError: true,
       );
       return;
     }
@@ -73,7 +77,12 @@ class _UsersPageState extends State<UsersPage> {
       _fetchUsers();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Eroare: $e')));
+        await StatusDialogHelper.show(
+          context,
+          title: 'Eroare actualizare rol',
+          message: '$e',
+          isError: true,
+        );
       }
     }
   }

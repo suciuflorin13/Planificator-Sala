@@ -10,6 +10,11 @@ type SyncPayload = {
   pull?: boolean;
   delete_propagation?: boolean;
   compose_google_title?: boolean;
+  local_delete_event_id?: string;
+  test_cleanup?: boolean;
+  cleanup_start?: string;
+  cleanup_end?: string;
+  cleanup_local_older_than_days?: number;
 };
 
 type GoogleTokenRow = {
@@ -36,7 +41,7 @@ type GoogleEventWindow = {
 };
 
 const SYNC_FORWARD_DAYS = 60;
-const LOCAL_RETENTION_DAYS = 30;
+const LOCAL_RETENTION_DAYS = 7;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -124,19 +129,113 @@ function normalizeDedupeValue(value: string | null | undefined): string {
     .toLowerCase();
 }
 
-function buildDedupeFingerprint({
+function normalizeEventType(value: string | null | undefined): string {
+  return normalizeDedupeValue(value);
+}
+
+function isGoogleEventType(value: string | null | undefined): boolean {
+  return normalizeEventType(value) == "google";
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripKnownGooglePrefixes(title: string): string {
+  let value = title.trim();
+  // Remove repeated legacy prefixes such as "google - " or "google|".
+  for (let i = 0; i < 6; i++) {
+    const next = value.replace(/^google\s*[-|:]\s*/i, "").trim();
+    if (next === value) break;
+    value = next;
+  }
+  return value;
+}
+
+function composeGoogleSummary({
+  type,
+  title,
+  composeTitle,
+}: {
+  type: string;
+  title: string;
+  composeTitle: boolean;
+}): string {
+  const rawType = type.trim();
+  const rawTitle = title.trim();
+  const cleanedTitle = stripKnownGooglePrefixes(rawTitle);
+
+  if (!composeTitle) {
+    return cleanedTitle || rawTitle || "Eveniment";
+  }
+
+  // If event type is Google, do not prefix type to avoid "google-google-title" growth.
+  if (!rawType || isGoogleEventType(rawType)) {
+    return cleanedTitle || rawTitle || "Eveniment";
+  }
+
+  const typePrefixRegex = new RegExp(`^${escapeRegExp(rawType)}\\s*[-|:]\\s*`, "i");
+  const titleWithoutOwnPrefix = cleanedTitle.replace(typePrefixRegex, "").trim();
+  const baseTitle = titleWithoutOwnPrefix || cleanedTitle || rawTitle;
+  return [rawType, baseTitle].filter(Boolean).join(" - ");
+}
+
+function buildTypeTitleLocationFingerprint({
+  eventType,
   title,
   location,
-  description,
+  startIso,
+  endIso,
+}: {
+  eventType: string | null | undefined;
+  title: string | null | undefined;
+  location: string | null | undefined;
+  startIso?: string | null | undefined;
+  endIso?: string | null | undefined;
+}): string {
+  const normalizeTs = (iso: string | null | undefined): string => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toISOString().substring(0, 16);
+  };
+
+  return [
+    normalizeDedupeValue(eventType),
+    normalizeDedupeValue(title),
+    normalizeDedupeValue(location),
+    normalizeDedupeValue(normalizeTs(startIso)),
+    normalizeDedupeValue(normalizeTs(endIso)),
+  ].join("|");
+}
+
+// Google events are deduplicated by title + location + period.
+function buildGoogleFingerprint({
+  title,
+  location,
+  startIso,
+  endIso,
 }: {
   title: string | null | undefined;
   location: string | null | undefined;
-  description: string | null | undefined;
+  startIso?: string | null | undefined;
+  endIso?: string | null | undefined;
 }): string {
+  const toTimeToken = (iso: string | null | undefined): string => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toISOString().substring(0, 16);
+  };
+
+  const startToken = toTimeToken(startIso);
+  const endToken = toTimeToken(endIso);
+
   return [
     normalizeDedupeValue(title),
     normalizeDedupeValue(location),
-    normalizeDedupeValue(description),
+    normalizeDedupeValue(startToken),
+    normalizeDedupeValue(endToken),
   ].join("|");
 }
 
@@ -175,30 +274,13 @@ function parseGoogleEventWindow(
   return null;
 }
 
-function extractParticipants(item: Record<string, unknown>): string[] {
-  const attendees = Array.isArray(item.attendees)
-    ? (item.attendees as Array<Record<string, unknown>>)
-    : [];
-
-  const values: string[] = [];
-  for (const attendee of attendees) {
-    const label =
-      ((attendee.displayName ?? attendee.email ?? "") as string).trim();
-    if (label.length > 0) {
-      values.push(label);
-    }
-  }
-
-  return Array.from(new Set(values)).slice(0, 20);
-}
-
 async function refreshAccessToken({
   supabase,
   tokenRow,
   clientId,
   clientSecret,
 }: {
-  supabase: ReturnType<typeof createClient>;
+  supabase: any;
   tokenRow: GoogleTokenRow;
   clientId: string;
   clientSecret: string;
@@ -331,8 +413,6 @@ async function listGoogleCalendarIds({
       if (!id) continue;
       const accessRole = (item.accessRole ?? "").toString().trim().toLowerCase();
       if (!accessRole || accessRole === "none") continue;
-      const selected = item.selected;
-      if (selected === false) continue;
       ids.add(id);
     }
 
@@ -350,37 +430,176 @@ type LocalEvent = {
   event_type: string;
   location: string;
   description: string | null;
+  participants: string[];
   start_time: string;
   end_time: string;
   source_all_day: boolean;
   updated_at: string | null;
 };
 
+type ProfileLite = {
+  id: string;
+  email: string | null;
+  gmail_address: string | null;
+  full_name: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  organization_id: string | null;
+};
+
+type GoogleAttendeePayload = {
+  email: string;
+  displayName?: string;
+};
+
+type LocalDeleteCandidate = {
+  id: string;
+  title: string;
+  event_type: string;
+  location: string;
+  start_time: string;
+  end_time: string;
+  source_provider: string | null;
+  event_scope: string;
+  owner_user_id: string | null;
+  organization_id: string | null;
+};
+
 type GoogleEventPayload = {
   summary: string;
   location?: string;
   description?: string;
+  attendees?: GoogleAttendeePayload[];
   start: { dateTime?: string; date?: string; timeZone?: string };
   end: { dateTime?: string; date?: string; timeZone?: string };
 };
 
+function normalizeEmail(value: string | null | undefined): string {
+  return (value ?? "").toString().trim().toLowerCase();
+}
+
+function parseEmailCandidate(value: string | null | undefined): string {
+  const raw = (value ?? "").toString().trim();
+  if (!raw) return "";
+  const bracketMatch = raw.match(/<([^>]+)>/);
+  const candidate = bracketMatch ? bracketMatch[1] : raw;
+  const emailMatch = candidate.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return normalizeEmail(emailMatch ? emailMatch[0] : "");
+}
+
+function profileDisplayName(profile: ProfileLite): string {
+  const full = (profile.full_name ?? "").toString().trim();
+  if (full) return full;
+  const merged = `${(profile.first_name ?? "").toString().trim()} ${(profile.last_name ?? "").toString().trim()}`.trim();
+  if (merged) return merged;
+  return normalizeEmail(profile.email) || normalizeEmail(profile.gmail_address);
+}
+
+function resolveParticipantsFromGoogleItem(
+  item: Record<string, unknown>,
+  profileNameByEmail: Map<string, string>,
+): string[] {
+  const attendees = Array.isArray(item.attendees)
+    ? (item.attendees as Array<Record<string, unknown>>)
+    : [];
+
+  const values: string[] = [];
+  for (const attendee of attendees) {
+    const email = normalizeEmail((attendee.email ?? "").toString());
+    const displayNameRaw = (attendee.displayName ?? "").toString().trim();
+    if (email && profileNameByEmail.has(email)) {
+      values.push(profileNameByEmail.get(email)!);
+      continue;
+    }
+
+    if (displayNameRaw) {
+      values.push(displayNameRaw);
+      continue;
+    }
+
+    if (email) {
+      values.push(email.split("@")[0]);
+    }
+  }
+
+  return Array.from(new Set(values)).slice(0, 40);
+}
+
+function resolveGoogleAttendeesFromLocalParticipants({
+  participants,
+  profileEmailByName,
+  profileNameByEmail,
+}: {
+  participants: string[];
+  profileEmailByName: Map<string, string>;
+  profileNameByEmail: Map<string, string>;
+}): GoogleAttendeePayload[] {
+  const out: GoogleAttendeePayload[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of participants) {
+    const name = (raw ?? "").toString().trim();
+    if (!name) continue;
+
+    let email = "";
+    const emailFromText = parseEmailCandidate(name);
+    if (emailFromText) {
+      email = emailFromText;
+    } else {
+      email = profileEmailByName.get(normalizeDedupeValue(name)) ?? "";
+    }
+
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+
+    const displayName = profileNameByEmail.get(email) ?? name;
+    out.push({ email, displayName });
+  }
+
+  return out.slice(0, 100);
+}
+
+function isLocalAllDayEvent(event: LocalEvent): boolean {
+  if (event.source_all_day === true) return true;
+
+  const start = new Date(event.start_time);
+  const end = new Date(event.end_time);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
+
+  const sH = start.getUTCHours();
+  const sM = start.getUTCMinutes();
+  const eH = end.getUTCHours();
+  const eM = end.getUTCMinutes();
+
+  // Canonical all-day local representation in app.
+  if (sH === 0 && sM === 0 && eH === 23 && (eM === 59 || eM === 58)) {
+    return true;
+  }
+
+  // Legacy all-day marker used in availability logic.
+  if (sH === 9 && sM === 0 && eH === 23 && eM === 0) {
+    return true;
+  }
+
+  return false;
+}
+
 function buildGoogleEventPayload(
   event: LocalEvent,
   composeTitle: boolean,
+  attendees: GoogleAttendeePayload[],
 ): GoogleEventPayload {
   const rawTitle = (event.title ?? "").toString().trim();
   const type = (event.event_type ?? "").toString().trim();
   const loc = (event.location ?? "").toString().trim();
 
-  let summary: string;
-  if (composeTitle) {
-    summary = [rawTitle, type, loc].filter(Boolean).join(" | ");
-  } else {
-    summary = rawTitle;
-  }
-  if (!summary) summary = "Eveniment";
+  const summary = composeGoogleSummary({
+    type,
+    title: rawTitle,
+    composeTitle,
+  });
 
-  const isAllDay = event.source_all_day === true;
+  const isAllDay = isLocalAllDayEvent(event);
   let start: GoogleEventPayload["start"];
   let end: GoogleEventPayload["end"];
 
@@ -400,6 +619,7 @@ function buildGoogleEventPayload(
   if (loc) payload.location = loc;
   const desc = (event.description ?? "").toString().trim();
   if (desc) payload.description = desc;
+  if (attendees.length > 0) payload.attendees = attendees;
   return payload;
 }
 
@@ -465,6 +685,35 @@ async function updateGoogleEvent({
   };
 }
 
+async function deleteGoogleEvent({
+  accessToken,
+  calendarId,
+  googleEventId,
+}: {
+  accessToken: string;
+  calendarId: string;
+  googleEventId: string;
+}): Promise<void> {
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(googleEventId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+  );
+
+  if (response.status === 404 || response.status === 410) {
+    return;
+  }
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    throw new Error(`Failed deleting Google event ${googleEventId}: ${JSON.stringify(payload)}`);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
@@ -502,6 +751,8 @@ Deno.serve(async (req: Request) => {
     const organizationId = (body.organization_id ?? "").trim();
     const doPull = body.pull ?? true;
     const doDeletePropagation = body.delete_propagation ?? true;
+    const localDeleteEventId = (body.local_delete_event_id ?? "").trim();
+    const isTestCleanup = body.test_cleanup === true;
 
     if (scope !== "organization" && scope !== "personal") {
       return json(400, { ok: false, message: "Scope invalid." });
@@ -511,7 +762,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: profile, error: profileError } = await supabase
       .from("profiles")
-      .select("id, email, gmail_address, organization_id")
+      .select("id, email, gmail_address, organization_id, role")
       .eq("id", user.id)
       .single();
 
@@ -585,6 +836,205 @@ Deno.serve(async (req: Request) => {
       tokenQuery = tokenQuery.eq("user_id", user.id);
     }
 
+    if (isTestCleanup) {
+      const role = (profile["role"] ?? "").toString().trim().toLowerCase();
+      if (role !== "admin") {
+        return json(403, {
+          ok: false,
+          scope,
+          message: "Doar admin poate folosi curățarea de test.",
+        });
+      }
+
+      const olderThanDays = Math.max(1, Math.min(30, Number(body.cleanup_local_older_than_days ?? 7)));
+      const now = new Date();
+      const parsedStart = body.cleanup_start ? new Date(body.cleanup_start) : null;
+      const weekStartBase = parsedStart && !Number.isNaN(parsedStart.getTime()) ? parsedStart : now;
+      const weekStart = startOfUtcDay(weekStartBase);
+
+      const parsedEnd = body.cleanup_end ? new Date(body.cleanup_end) : null;
+      let weekEnd = parsedEnd && !Number.isNaN(parsedEnd.getTime())
+        ? endOfUtcDay(parsedEnd)
+        : endOfUtcDay(new Date(weekStart.getTime() + 6 * 24 * 60 * 60 * 1000));
+
+      const maxEnd = endOfUtcDay(new Date(weekStart.getTime() + 6 * 24 * 60 * 60 * 1000));
+      if (weekEnd.getTime() > maxEnd.getTime()) {
+        weekEnd = maxEnd;
+      }
+
+      if (weekEnd.getTime() < weekStart.getTime()) {
+        return json(400, {
+          ok: false,
+          scope,
+          message: "Interval cleanup invalid.",
+        });
+      }
+
+      let weeklyCleanupQuery = supabase
+        .from("events")
+        .delete()
+        .eq("event_scope", scope)
+        .or("source_provider.is.null,source_provider.neq.google")
+        .gte("start_time", weekStart.toISOString())
+        .lte("start_time", weekEnd.toISOString());
+
+      if (scope === "organization") {
+        weeklyCleanupQuery = weeklyCleanupQuery.eq("organization_id", organizationId);
+      } else {
+        weeklyCleanupQuery = weeklyCleanupQuery.eq("owner_user_id", user.id);
+      }
+
+      const { data: weeklyDeletedRows, error: weeklyDeleteError } = await weeklyCleanupQuery.select("id");
+      if (weeklyDeleteError) {
+        throw new Error(`Failed test cleanup on selected week: ${weeklyDeleteError.message}`);
+      }
+
+      const olderCutoff = startOfUtcDay(new Date(now.getTime() - olderThanDays * 24 * 60 * 60 * 1000));
+      let oldCleanupQuery = supabase
+        .from("events")
+        .delete()
+        .eq("event_scope", scope)
+        .or("source_provider.is.null,source_provider.neq.google")
+        .lt("end_time", olderCutoff.toISOString());
+
+      if (scope === "organization") {
+        oldCleanupQuery = oldCleanupQuery.eq("organization_id", organizationId);
+      } else {
+        oldCleanupQuery = oldCleanupQuery.eq("owner_user_id", user.id);
+      }
+
+      const { data: oldDeletedRows, error: oldDeleteError } = await oldCleanupQuery.select("id");
+      if (oldDeleteError) {
+        throw new Error(`Failed test cleanup for older events: ${oldDeleteError.message}`);
+      }
+
+      return json(200, {
+        ok: true,
+        scope,
+        test_cleanup: true,
+        message: "Curățare de test finalizată.",
+        stats: {
+          cleanup_start: weekStart.toISOString(),
+          cleanup_end: weekEnd.toISOString(),
+          cleanup_older_than_days: olderThanDays,
+          deleted_in_selected_week: (weeklyDeletedRows ?? []).length,
+          deleted_older_than_cutoff: (oldDeletedRows ?? []).length,
+          older_cutoff: olderCutoff.toISOString(),
+        },
+      });
+    }
+
+    let profileLookupQuery = supabase
+      .from("profiles")
+      .select("id, email, gmail_address, full_name, first_name, last_name, organization_id");
+
+    if (scope === "organization") {
+      profileLookupQuery = profileLookupQuery.eq("organization_id", organizationId);
+    } else {
+      const userOrgId = (profile.organization_id ?? "").toString().trim();
+      if (userOrgId) {
+        profileLookupQuery = profileLookupQuery.eq("organization_id", userOrgId);
+      } else {
+        profileLookupQuery = profileLookupQuery.eq("id", user.id);
+      }
+    }
+
+    const { data: profileRows, error: profileRowsError } = await profileLookupQuery;
+    if (profileRowsError) {
+      throw new Error(`Failed loading profile lookup map: ${profileRowsError.message}`);
+    }
+
+    const profileNameByEmail = new Map<string, string>();
+    const profileEmailByName = new Map<string, string>();
+    for (const row of (profileRows ?? []) as ProfileLite[]) {
+      const displayName = profileDisplayName(row);
+      const displayNameKey = normalizeDedupeValue(displayName);
+      const primaryEmail = normalizeEmail(row.email);
+      const gmailEmail = normalizeEmail(row.gmail_address);
+
+      if (primaryEmail) {
+        profileNameByEmail.set(primaryEmail, displayName);
+        if (!profileEmailByName.has(displayNameKey)) {
+          profileEmailByName.set(displayNameKey, primaryEmail);
+        }
+      }
+
+      if (gmailEmail) {
+        profileNameByEmail.set(gmailEmail, displayName);
+        if (!profileEmailByName.has(displayNameKey)) {
+          profileEmailByName.set(displayNameKey, gmailEmail);
+        }
+      }
+    }
+
+    let localDeleteCandidate: LocalDeleteCandidate | null = null;
+    if (localDeleteEventId) {
+      const { data: eventForDelete, error: eventForDeleteError } = await supabase
+        .from("events")
+        .select("id, title, event_type, location, start_time, end_time, source_provider, event_scope, owner_user_id, organization_id")
+        .eq("id", localDeleteEventId)
+        .maybeSingle();
+
+      if (eventForDeleteError) {
+        throw new Error(`Failed loading local delete candidate: ${eventForDeleteError.message}`);
+      }
+
+      if (!eventForDelete?.id) {
+        return json(200, {
+          ok: true,
+          scope,
+          local_delete: true,
+          skipped: true,
+          message: "Evenimentul local nu mai există. Nu este necesară ștergerea în Google.",
+        });
+      }
+
+      localDeleteCandidate = eventForDelete as LocalDeleteCandidate;
+
+      const eventScope = (localDeleteCandidate.event_scope ?? "").toString();
+      if (eventScope !== scope) {
+        return json(400, {
+          ok: false,
+          scope,
+          local_delete: true,
+          message: "Scope-ul transmis nu corespunde evenimentului local.",
+        });
+      }
+
+      if (scope === "organization") {
+        const eventOrgId = (localDeleteCandidate.organization_id ?? "").toString();
+        if (!eventOrgId || eventOrgId != organizationId) {
+          return json(403, {
+            ok: false,
+            scope,
+            local_delete: true,
+            message: "Evenimentul nu aparține organizației selectate.",
+          });
+        }
+      } else {
+        const ownerId = (localDeleteCandidate.owner_user_id ?? "").toString();
+        if (ownerId != user.id) {
+          return json(403, {
+            ok: false,
+            scope,
+            local_delete: true,
+            message: "Evenimentul personal nu aparține utilizatorului curent.",
+          });
+        }
+      }
+
+      const sourceProvider = (localDeleteCandidate.source_provider ?? "").toString().trim().toLowerCase();
+      if (sourceProvider === "google" || isGoogleEventType(localDeleteCandidate.event_type)) {
+        return json(200, {
+          ok: true,
+          scope,
+          local_delete: true,
+          skipped: true,
+          message: "Eveniment de tip Google: ștergerea locală nu modifică Google Calendar.",
+        });
+      }
+    }
+
     const { data: tokenRow } = await tokenQuery.maybeSingle();
 
     if (!tokenRow?.refresh_token) {
@@ -627,6 +1077,104 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    if (localDeleteCandidate != null) {
+      const { data: linkRow, error: linkRowError } = await supabase
+        .from("external_event_links")
+        .select("external_event_id")
+        .eq("local_event_id", localDeleteCandidate.id)
+        .eq("provider", "google")
+        .eq("sync_scope", scope)
+        .maybeSingle();
+
+      if (linkRowError) {
+        throw new Error(`Failed loading external link for local delete: ${linkRowError.message}`);
+      }
+
+      if (linkRow?.external_event_id) {
+        const externalId = linkRow.external_event_id.toString();
+        const googleCalendarId = externalId.includes("::")
+          ? externalId.split("::")[0]
+          : calendarId;
+        const googleEventId = externalId.includes("::")
+          ? externalId.split("::").slice(1).join("::")
+          : externalId;
+
+        await deleteGoogleEvent({
+          accessToken,
+          calendarId: googleCalendarId,
+          googleEventId,
+        });
+
+        return json(200, {
+          ok: true,
+          scope,
+          local_delete: true,
+          deleted_in_google: true,
+          message: "Evenimentul local a fost șters și din Google Calendar.",
+        });
+      }
+
+      // Fallback for older events without link rows (legacy title formats).
+      const localStart = new Date(localDeleteCandidate.start_time);
+      const localEnd = new Date(localDeleteCandidate.end_time);
+      const timeMin = new Date(localStart.getTime() - 24 * 60 * 60 * 1000).toISOString();
+      const timeMax = new Date(localEnd.getTime() + 24 * 60 * 60 * 1000).toISOString();
+      const googleItems = await listGoogleEvents({
+        accessToken,
+        calendarId,
+        timeMin,
+        timeMax,
+      });
+
+      const title = (localDeleteCandidate.title ?? "").toString().trim();
+      const eventType = (localDeleteCandidate.event_type ?? "").toString().trim();
+      const location = (localDeleteCandidate.location ?? "").toString().trim();
+      const candidateSummaries = new Set<string>([
+        normalizeDedupeValue([eventType, title].filter(Boolean).join(" - ")),
+        normalizeDedupeValue([title, eventType, location].filter(Boolean).join(" | ")),
+        normalizeDedupeValue([title, eventType].filter(Boolean).join(" | ")),
+        normalizeDedupeValue(title),
+      ]);
+      const locationNorm = normalizeDedupeValue(location);
+
+      let matchedGoogleEventId = "";
+      for (const item of googleItems) {
+        if ((item.status ?? "").toString() === "cancelled") continue;
+        const summaryNorm = normalizeDedupeValue((item.summary ?? "").toString());
+        const locationItemNorm = normalizeDedupeValue((item.location ?? "").toString());
+        const id = (item.id ?? "").toString().trim();
+        if (!id) continue;
+        if (!candidateSummaries.has(summaryNorm)) continue;
+        if (locationNorm && locationItemNorm && locationNorm != locationItemNorm) continue;
+        matchedGoogleEventId = id;
+        break;
+      }
+
+      if (!matchedGoogleEventId) {
+        return json(200, {
+          ok: true,
+          scope,
+          local_delete: true,
+          skipped: true,
+          message: "Eveniment local șters. Nu a fost găsită o corespondență Google de șters.",
+        });
+      }
+
+      await deleteGoogleEvent({
+        accessToken,
+        calendarId,
+        googleEventId: matchedGoogleEventId,
+      });
+
+      return json(200, {
+        ok: true,
+        scope,
+        local_delete: true,
+        deleted_in_google: true,
+        message: "Evenimentul local a fost șters și din Google Calendar (fallback legacy).",
+      });
+    }
+
     if (!doPull && !body.push) {
       return json(200, {
         ok: true,
@@ -636,13 +1184,14 @@ Deno.serve(async (req: Request) => {
     }
 
     const now = new Date();
-    const syncWindowStart = startOfUtcDay(now);
+    // Sync window starts LOCAL_RETENTION_DAYS ago so recently-modified events are refreshed.
+    const syncWindowStart = startOfUtcDay(
+      new Date(now.getTime() - LOCAL_RETENTION_DAYS * 24 * 60 * 60 * 1000),
+    );
     const syncWindowEnd = endOfUtcDay(
-      new Date(syncWindowStart.getTime() + SYNC_FORWARD_DAYS * 24 * 60 * 60 * 1000),
+      new Date(now.getTime() + SYNC_FORWARD_DAYS * 24 * 60 * 60 * 1000),
     );
-    const localRetentionCutoff = startOfUtcDay(
-      new Date(syncWindowStart.getTime() - LOCAL_RETENTION_DAYS * 24 * 60 * 60 * 1000),
-    );
+    const localRetentionCutoff = syncWindowStart;
 
     // Shared stats (pull + push)
     let staleDeleted = 0;
@@ -682,10 +1231,8 @@ Deno.serve(async (req: Request) => {
       }
       staleDeleted = (staleDeletedRows ?? []).length;
 
-      if (scope === "organization") {
-        const linked = await listGoogleCalendarIds({ accessToken });
-        for (const id of linked) sourceCalendarIds.add(id);
-      }
+      const linked = await listGoogleCalendarIds({ accessToken });
+      for (const id of linked) sourceCalendarIds.add(id);
 
       const googleItemsWithCalendar: Array<{ item: Record<string, unknown>; calendarId: string }> = [];
       for (const sourceCalendarId of sourceCalendarIds) {
@@ -718,17 +1265,25 @@ Deno.serve(async (req: Request) => {
         throw new Error(`Failed loading local events map: ${existingRowsError.message}`);
       }
 
+      // The dedupe map must only contain APP-managed events (not Google-imported ones).
+      // Google events are matched exclusively by external ID; including them here would
+      // incorrectly block re-import of events whose external ID format changed.
       let dedupeQuery = supabase
         .from("events")
-        .select("id, title, location, description, google_description")
-        .eq("event_scope", scope)
+        .select("id, title, location, start_time, end_time")
+        .or("source_provider.is.null,source_provider.neq.google")
         .gte("end_time", localRetentionCutoff.toISOString())
         .lte("start_time", syncWindowEnd.toISOString());
 
       if (scope === "organization") {
         dedupeQuery = dedupeQuery.eq("organization_id", organizationId);
       } else {
-        dedupeQuery = dedupeQuery.eq("owner_user_id", user.id);
+        const userOrgId = (profile.organization_id ?? "").toString().trim();
+        if (userOrgId.length > 0) {
+          dedupeQuery = dedupeQuery.or(`owner_user_id.eq.${user.id},organization_id.eq.${userOrgId}`);
+        } else {
+          dedupeQuery = dedupeQuery.eq("owner_user_id", user.id);
+        }
       }
 
       const { data: dedupeRows, error: dedupeRowsError } = await dedupeQuery;
@@ -745,17 +1300,19 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      const localByFingerprint = new Map<string, string>();
+      const localByGoogleFingerprint = new Map<string, string>();
       for (const row of dedupeRows ?? []) {
         const localId = (row.id ?? "").toString().trim();
         if (!localId) continue;
-        const fp = buildDedupeFingerprint({
+
+        const googleFp = buildGoogleFingerprint({
           title: row.title?.toString(),
           location: row.location?.toString(),
-          description: (row.description ?? row.google_description)?.toString(),
+          startIso: row.start_time?.toString(),
+          endIso: row.end_time?.toString(),
         });
-        if (!localByFingerprint.has(fp)) {
-          localByFingerprint.set(fp, localId);
+        if (!localByGoogleFingerprint.has(googleFp)) {
+          localByGoogleFingerprint.set(googleFp, localId);
         }
       }
 
@@ -808,17 +1365,18 @@ Deno.serve(async (req: Request) => {
           continue;
         }
 
-        const participants = extractParticipants(item);
+        const participants = resolveParticipantsFromGoogleItem(item, profileNameByEmail);
         const title = (item.summary ?? "Eveniment Google").toString().trim();
         const location = (item.location ?? "").toString().trim();
         const description = extractDescription(item);
-        const fingerprint = buildDedupeFingerprint({
+        const fingerprint = buildGoogleFingerprint({
           title,
           location,
-          description,
+          startIso: window.startIso,
+          endIso: window.endIso,
         });
 
-        if (!localId && localByFingerprint.has(fingerprint)) {
+        if (!localId && localByGoogleFingerprint.has(fingerprint)) {
           deduplicated += 1;
           skipped += 1;
           continue;
@@ -875,7 +1433,7 @@ Deno.serve(async (req: Request) => {
           resolvedLocalId = inserted.id.toString();
           localByExternalId.set(externalEventId, resolvedLocalId);
           localByExternalId.set(rawExternalEventId, resolvedLocalId);
-          localByFingerprint.set(fingerprint, resolvedLocalId);
+          localByGoogleFingerprint.set(fingerprint, resolvedLocalId);
           created += 1;
         }
 
@@ -908,12 +1466,42 @@ Deno.serve(async (req: Request) => {
     if (body.push) {
       const composeTitle = body.compose_google_title ?? true;
 
+      type GoogleEventEntry = {
+        id: string;
+        updated: string | null;
+      };
+
+      const googleEventsForPush = await listGoogleEvents({
+        accessToken,
+        calendarId,
+        timeMin: syncWindowStart.toISOString(),
+        timeMax: syncWindowEnd.toISOString(),
+      });
+
+      const googleByFingerprint = new Map<string, GoogleEventEntry>();
+      for (const item of googleEventsForPush) {
+        if ((item.status ?? "").toString() === "cancelled") continue;
+        const id = (item.id ?? "").toString().trim();
+        if (!id) continue;
+        const title = (item.summary ?? "").toString().trim();
+        const location = (item.location ?? "").toString().trim();
+        const window = parseGoogleEventWindow(item);
+        const startIso = window?.startIso ?? "";
+        const endIso = window?.endIso ?? "";
+        const fp = buildGoogleFingerprint({ title, location, startIso, endIso });
+        if (!googleByFingerprint.has(fp)) {
+          googleByFingerprint.set(fp, {
+            id,
+            updated: (item.updated ?? null) as string | null,
+          });
+        }
+      }
+
       // Load app-managed events in the sync window (excludes Google-sourced).
       let localEventsQuery = supabase
         .from("events")
-        .select("id, title, event_type, location, description, start_time, end_time, source_all_day, updated_at")
+        .select("id, title, event_type, location, description, participants, start_time, end_time, source_all_day, source_provider, updated_at")
         .eq("event_scope", scope)
-        .or("source_provider.is.null,source_provider.neq.google")
         .gte("end_time", syncWindowStart.toISOString())
         .lte("start_time", syncWindowEnd.toISOString());
 
@@ -955,23 +1543,65 @@ Deno.serve(async (req: Request) => {
         existingPushLinks.map((l) => [l.local_event_id.toString(), l]),
       );
 
+      const seenLocalTypeTitleLocation = new Set<string>();
+
       for (const event of localEvents ?? []) {
         const eventId = (event.id ?? "").toString();
         if (!eventId) continue;
 
+        const localTypeTitleLocationFp = buildTypeTitleLocationFingerprint({
+          eventType: (event.event_type ?? "").toString(),
+          title: (event.title ?? "").toString(),
+          location: (event.location ?? "").toString(),
+          startIso: (event.start_time ?? "").toString(),
+          endIso: (event.end_time ?? "").toString(),
+        });
+        if (seenLocalTypeTitleLocation.has(localTypeTitleLocationFp)) {
+          pushSkipped++;
+          continue;
+        }
+        seenLocalTypeTitleLocation.add(localTypeTitleLocationFp);
+
         const existingLink = pushLinkByLocalId.get(eventId);
+        const sourceProvider = (event.source_provider ?? "").toString().trim().toLowerCase();
+        const isGoogleTyped = isGoogleEventType((event.event_type ?? "").toString());
         const localUpdatedMs = event.updated_at ? new Date(event.updated_at).getTime() : 0;
 
-        // Last Write Wins: skip if Google was updated at the same time or more recently.
-        if (existingLink?.external_updated_at) {
-          const googleUpdatedMs = new Date(existingLink.external_updated_at).getTime();
-          if (googleUpdatedMs >= localUpdatedMs) {
-            pushSkipped++;
-            continue;
-          }
+        // Push/LWW is applied only for app events.
+        if (sourceProvider === "google" || isGoogleTyped) {
+          pushSkipped++;
+          continue;
         }
 
-        const googlePayload = buildGoogleEventPayload(event as LocalEvent, composeTitle);
+        // Skip push if the event was already synced and the app event has not changed
+        // since the last successful push (external_updated_at >= local updated_at).
+        if (existingLink) {
+          if (existingLink.external_updated_at) {
+            const googleUpdatedMs = new Date(existingLink.external_updated_at).getTime();
+            if (googleUpdatedMs >= localUpdatedMs) {
+              pushSkipped++;
+              continue;
+            }
+          }
+          // existingLink exists but no timestamp → app event has never been successfully
+          // round-tripped; fall through to update so the link gets a fresh timestamp.
+        }
+
+        const attendees = resolveGoogleAttendeesFromLocalParticipants({
+          participants: Array.isArray(event.participants)
+            ? event.participants.map((p: unknown) => (p ?? "").toString())
+            : [],
+          profileEmailByName,
+          profileNameByEmail,
+        });
+
+        const googlePayload = buildGoogleEventPayload(event as LocalEvent, composeTitle, attendees);
+        const googleFingerprint = buildGoogleFingerprint({
+          title: googlePayload.summary,
+          location: googlePayload.location ?? "",
+          startIso: event.start_time,
+          endIso: event.end_time,
+        });
 
         try {
           if (existingLink) {
@@ -997,8 +1627,33 @@ Deno.serve(async (req: Request) => {
               .eq("provider", "google")
               .eq("sync_scope", scope);
 
+            googleByFingerprint.set(googleFingerprint, {
+              id: result.id,
+              updated: result.updated,
+            });
+
             pushUpdated++;
           } else {
+            const existingGoogleByFingerprint = googleByFingerprint.get(googleFingerprint);
+            if (existingGoogleByFingerprint) {
+              const existingExternalId = `${calendarId}::${existingGoogleByFingerprint.id}`;
+              await supabase.from("external_event_links").upsert({
+                local_event_id: eventId,
+                provider: "google",
+                external_event_id: existingExternalId,
+                sync_scope: scope,
+                owner_organization_id: scope === "organization" ? organizationId : null,
+                owner_user_id: scope === "personal" ? user.id : null,
+                external_updated_at: existingGoogleByFingerprint.updated,
+                deleted_in_external: false,
+                deleted_in_local: false,
+                last_seen_at: new Date().toISOString(),
+              }, { onConflict: "provider,external_event_id,sync_scope" });
+
+              pushSkipped++;
+              continue;
+            }
+
             // Create new Google event.
             const result = await createGoogleEvent({
               accessToken,
@@ -1019,6 +1674,11 @@ Deno.serve(async (req: Request) => {
               deleted_in_external: false,
               deleted_in_local: false,
               last_seen_at: new Date().toISOString(),
+            });
+
+            googleByFingerprint.set(googleFingerprint, {
+              id: result.id,
+              updated: result.updated,
             });
 
             pushCreated++;

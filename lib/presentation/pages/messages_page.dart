@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../data/repositories.dart';
 import '../../domain/models.dart';
+import '../helpers/status_dialog_helper.dart';
 import '../theme.dart';
 
 class MessagesPage extends StatefulWidget {
@@ -257,7 +258,12 @@ class _MessagesPageState extends State<MessagesPage> {
                                 _loadMessages();
                               } catch (e) {
                                 if (mounted) {
-                                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Eroare: $e')));
+                                  await StatusDialogHelper.show(
+                                    context,
+                                    title: 'Eroare trimitere mesaj',
+                                    message: '$e',
+                                    isError: true,
+                                  );
                                 }
                               } finally {
                                 setBS(() => sending = false);

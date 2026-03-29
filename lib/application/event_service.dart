@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../domain/enums.dart';
 import '../domain/models.dart';
 import '../data/repositories.dart';
+import 'google_calendar_service.dart';
 import 'space_ownership_service.dart';
 
 class EventService {
@@ -12,16 +13,19 @@ class EventService {
   final RequestRepository _requests;
   final MessageRepository _messages;
   final ProfileRepository _profiles;
+  final GoogleCalendarService _googleSync;
 
   EventService({
     EventRepository? events,
     RequestRepository? requests,
     MessageRepository? messages,
     ProfileRepository? profiles,
+    GoogleCalendarService? googleSync,
   })  : _events = events ?? EventRepository(),
         _requests = requests ?? RequestRepository(),
         _messages = messages ?? MessageRepository(),
-        _profiles = profiles ?? ProfileRepository();
+      _profiles = profiles ?? ProfileRepository(),
+      _googleSync = googleSync ?? const GoogleCalendarService();
 
   String get _currentUserId => Supabase.instance.client.auth.currentUser!.id;
 
@@ -275,6 +279,22 @@ class EventService {
 
   /// Delete an event and its associated requests.
   Future<void> deleteEvent(String eventId) async {
+    final event = await _events.fetchById(eventId);
+
+    final deleteResult = await _googleSync.deleteLocalEventFromGoogle(
+      scope: event.scope == EventScope.personal
+          ? GoogleSyncScope.personal
+          : GoogleSyncScope.organization,
+      eventId: eventId,
+      organizationId: event.scope == EventScope.organization
+          ? event.organizationId
+          : null,
+    );
+
+    if (deleteResult['ok'] != true) {
+      throw Exception((deleteResult['message'] ?? 'Nu s-a putut sincroniza ștergerea în Google Calendar.').toString());
+    }
+
     await _requests.deleteByEventId(eventId);
     await _events.delete(eventId);
   }

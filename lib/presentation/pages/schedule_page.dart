@@ -12,6 +12,7 @@ import '../../data/repositories.dart';
 import '../../application/space_ownership_service.dart';
 import '../theme.dart';
 import '../helpers/calendar_helpers.dart';
+import '../helpers/status_dialog_helper.dart';
 import '../widgets/appointment_card.dart';
 import '../widgets/legend_widget.dart';
 import '../dialogs/add_event_dialog.dart';
@@ -133,23 +134,26 @@ class _SchedulePageState extends State<SchedulePage> {
     for (final event in _events) {
       final orgName = _ownership?.orgNameById(event.organizationId) ?? '';
       final isAllDay = event.isAllDay;
+      final isImportedGoogle = event.isImportedGoogle;
       all.add(Appointment(
         id: 'event_${event.id}',
-        startTime: isAllDay ? normalizeAllDayStart(event.startTime) : event.startTime,
-        endTime: isAllDay ? normalizeAllDayEnd(event.endTime) : event.endTime,
+        startTime: isAllDay ? event.calendarDisplayStart : event.startTime,
+        endTime: isAllDay ? event.calendarDisplayEnd : event.endTime,
         isAllDay: isAllDay,
         subject: buildCalendarSubject(
           isRequest: false,
-          type: EventTypes.displayLabel(event.eventType, fallback: event.title),
+          type: isImportedGoogle ? '[G]' : EventTypes.displayLabel(event.eventType, fallback: event.title),
           title: event.title,
           organization: orgName,
           location: event.location,
         ),
-        color: AppTheme.eventColorForOrgAndType(
-          orgId: event.organizationId,
-          magicId: _magicId,
-          eventType: event.eventType,
-        ),
+        color: isImportedGoogle
+            ? AppTheme.googleImportedEvent
+            : AppTheme.eventColorForOrgAndType(
+                orgId: event.organizationId,
+                magicId: _magicId,
+                eventType: event.eventType,
+              ),
         notes: 'event',
       ));
     }
@@ -339,8 +343,11 @@ class _SchedulePageState extends State<SchedulePage> {
       if (result == true) _fetchData();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Eroare la încărcarea evenimentului: $e')),
+        await StatusDialogHelper.show(
+          context,
+          title: 'Eroare la încărcare',
+          message: 'Eroare la încărcarea evenimentului: $e',
+          isError: true,
         );
       }
     }

@@ -35,6 +35,7 @@ class AppTheme {
   static const Color maidanEvent = Color(0xFF9A4D03);
   static const Color requestCreatedEvent = Color(0xFFD84A4A);
   static const Color requestReceivedEvent = Color(0xFF8E2E2E);
+  static const Color googleImportedEvent = Color(0xFF0E7490);
 
   // ── Helpers ──
   static Color eventColorForOrg(String orgId, String? magicId) {

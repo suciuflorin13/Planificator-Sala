@@ -97,6 +97,8 @@ class CalendarEvent {
   final String? ownerUserId;
   final String? sourceRequestId;
   final String? status;
+  final bool sourceAllDay;
+  final String? sourceProvider;
 
   const CalendarEvent({
     required this.id,
@@ -112,11 +114,30 @@ class CalendarEvent {
     this.ownerUserId,
     this.sourceRequestId,
     this.status,
+    this.sourceAllDay = false,
+    this.sourceProvider,
   });
 
   ManagedLocation? get managedLocation => ManagedLocation.fromString(location);
 
-  bool get isAllDay => isAllDayRange(startTime, endTime);
+  bool get isAllDay => sourceAllDay || isAllDayRange(startTime, endTime);
+  bool get isImportedGoogle => (sourceProvider ?? '').toLowerCase() == 'google';
+
+  // Google all-day events are date-based; using UTC day prevents timezone spillover
+  // where a one-day all-day event appears across two local days.
+  DateTime get calendarDisplayStart {
+    if (!isAllDay) return startTime;
+    if (!sourceAllDay) return DateTime(startTime.year, startTime.month, startTime.day, 0, 0);
+    final sUtc = startTime.toUtc();
+    return DateTime(sUtc.year, sUtc.month, sUtc.day, 0, 0);
+  }
+
+  DateTime get calendarDisplayEnd {
+    if (!isAllDay) return endTime;
+    if (!sourceAllDay) return DateTime(endTime.year, endTime.month, endTime.day, 23, 59);
+    final eUtc = endTime.toUtc();
+    return DateTime(eUtc.year, eUtc.month, eUtc.day, 23, 59);
+  }
 
   /// Check if two DateTimes represent a visible all-day range.
   static bool isAllDayRange(DateTime start, DateTime end) {
@@ -154,6 +175,8 @@ class CalendarEvent {
       ownerUserId: map['owner_user_id']?.toString(),
       sourceRequestId: map['source_request_id']?.toString(),
       status: map['status']?.toString(),
+      sourceAllDay: map['source_all_day'] == true,
+      sourceProvider: map['source_provider']?.toString(),
     );
   }
 
@@ -168,6 +191,7 @@ class CalendarEvent {
       'created_by': createdBy,
       'participants': participants,
       'event_scope': scope.name,
+      'source_all_day': sourceAllDay,
       if (ownerUserId != null) 'owner_user_id': ownerUserId,
       if (sourceRequestId != null) 'source_request_id': sourceRequestId,
     };

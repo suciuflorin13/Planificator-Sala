@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../data/repositories.dart';
 import '../../domain/models.dart';
 import '../theme.dart';
+import '../helpers/status_dialog_helper.dart';
 import 'home_page.dart';
 
 class RegisterPage extends StatefulWidget {
@@ -56,8 +57,11 @@ class _RegisterPageState extends State<RegisterPage> {
     final password = _passwordCtrl.text.trim();
 
     if (firstName.isEmpty || lastName.isEmpty || email.isEmpty || password.isEmpty || _selectedOrgId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Te rugăm să completezi toate câmpurile!')),
+      await StatusDialogHelper.show(
+        context,
+        title: 'Date incomplete',
+        message: 'Te rugăm să completezi toate câmpurile!',
+        isError: true,
       );
       return;
     }
@@ -101,8 +105,11 @@ class _RegisterPageState extends State<RegisterPage> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Eroare la înregistrare: $e')),
+        await StatusDialogHelper.show(
+          context,
+          title: 'Eroare la înregistrare',
+          message: '$e',
+          isError: true,
         );
       }
     } finally {

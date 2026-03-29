@@ -43,6 +43,7 @@ class _OrgEventsPageState extends State<OrgEventsPage> {
   List<Appointment> _appointments = [];
   bool _isLoading = true;
   bool _isSyncing = false;
+  bool _syncProgressDialogOpen = false;
   String? _filterType;
   String _currentView = 'Săptămână';
   DateTime? _selectedMonthDay;
@@ -145,23 +146,26 @@ class _OrgEventsPageState extends State<OrgEventsPage> {
       final orgName = _ownership?.orgNameById(event.organizationId) ?? '';
 
       final isAllDay = event.isAllDay;
+      final isImportedGoogle = event.isImportedGoogle;
       all.add(Appointment(
         id: 'event_${event.id}',
-        startTime: isAllDay ? normalizeAllDayStart(event.startTime) : event.startTime,
-        endTime: isAllDay ? normalizeAllDayEnd(event.endTime) : event.endTime,
+        startTime: isAllDay ? event.calendarDisplayStart : event.startTime,
+        endTime: isAllDay ? event.calendarDisplayEnd : event.endTime,
         isAllDay: isAllDay,
         subject: buildCalendarSubject(
           isRequest: false,
-          type: EventTypes.displayLabel(event.eventType, fallback: event.title),
+          type: isImportedGoogle ? '[G]' : EventTypes.displayLabel(event.eventType, fallback: event.title),
           title: event.title,
           organization: orgName,
           location: event.location,
         ),
-        color: AppTheme.eventColorForOrgAndType(
-          orgId: event.organizationId,
-          magicId: _magicId,
-          eventType: event.eventType,
-        ),
+        color: isImportedGoogle
+            ? AppTheme.googleImportedEvent
+            : AppTheme.eventColorForOrgAndType(
+                orgId: event.organizationId,
+                magicId: _magicId,
+                eventType: event.eventType,
+              ),
         notes: 'event',
       ));
     }
@@ -356,14 +360,90 @@ class _OrgEventsPageState extends State<OrgEventsPage> {
       if (result == true) _fetchData();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Eroare: $e')));
+        await _showPersistentStatusDialog(
+          title: 'Eroare',
+          message: 'Eroare: $e',
+          isError: true,
+        );
       }
     }
+  }
+
+  Future<void> _showPersistentStatusDialog({
+    required String title,
+    required String message,
+    bool isError = false,
+  }) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(
+              isError ? Icons.error_outline : Icons.info_outline,
+              color: isError ? AppTheme.notification : AppTheme.magicPrimary,
+              size: 20,
+            ),
+            const SizedBox(width: 8),
+            Expanded(child: Text(title)),
+          ],
+        ),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context, rootNavigator: true).pop(),
+            child: const Text('Închide'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showSyncProgressDialog() async {
+    if (!mounted || _syncProgressDialogOpen) return;
+    _syncProgressDialogOpen = true;
+    unawaited(showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      builder: (_) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('Sincronizare în curs'),
+          content: const Row(
+            children: [
+              SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+              SizedBox(width: 12),
+              Expanded(child: Text('Se procesează evenimentele Google Calendar...')),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                _syncProgressDialogOpen = false;
+                Navigator.of(context, rootNavigator: true).pop();
+              },
+              child: const Text('Închide'),
+            ),
+          ],
+        ),
+      ),
+    ));
+  }
+
+  void _closeSyncProgressDialogIfOpen() {
+    if (!mounted || !_syncProgressDialogOpen) return;
+    _syncProgressDialogOpen = false;
+    Navigator.of(context, rootNavigator: true).pop();
   }
 
   Future<void> _syncNow() async {
     if (_isSyncing) return;
     setState(() => _isSyncing = true);
+    await _showSyncProgressDialog();
 
     try {
       final Map<String, dynamic> result;
@@ -384,14 +464,78 @@ class _OrgEventsPageState extends State<OrgEventsPage> {
       }
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+        _closeSyncProgressDialogIfOpen();
+        await _showPersistentStatusDialog(
+          title: ok ? 'Sincronizare finalizată' : 'Sincronizare cu probleme',
+          message: msg,
+          isError: !ok,
+        );
       }
       if (ok) _fetchData();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Eroare sincronizare: $e')));
+        _closeSyncProgressDialogIfOpen();
+        await _showPersistentStatusDialog(
+          title: 'Eroare sincronizare',
+          message: '$e',
+          isError: true,
+        );
       }
     } finally {
+      _closeSyncProgressDialogIfOpen();
+      if (mounted) setState(() => _isSyncing = false);
+    }
+  }
+
+  Future<void> _cleanupTestWeek() async {
+    if (_isSyncing || widget.personalMode || _userRole != UserRole.admin) return;
+    setState(() => _isSyncing = true);
+    await _showSyncProgressDialog();
+
+    try {
+      DateTime weekStart;
+      DateTime weekEnd;
+
+      if (_visibleDates.isNotEmpty) {
+        final sorted = [..._visibleDates]..sort((a, b) => a.compareTo(b));
+        weekStart = DateTime(sorted.first.year, sorted.first.month, sorted.first.day);
+        weekEnd = DateTime(sorted.last.year, sorted.last.month, sorted.last.day, 23, 59, 59);
+      } else {
+        final now = DateTime.now();
+        weekStart = DateTime(now.year, now.month, now.day);
+        weekEnd = weekStart.add(const Duration(days: 6, hours: 23, minutes: 59, seconds: 59));
+      }
+
+      final result = await _googleSync.cleanupTestWeek(
+        scope: widget.personalMode ? GoogleSyncScope.personal : GoogleSyncScope.organization,
+        organizationId: widget.personalMode ? null : (_userOrgId ?? ''),
+        weekStart: weekStart,
+        weekEnd: weekEnd,
+        cleanupLocalOlderThanDays: 7,
+      );
+
+      final ok = result['ok'] == true;
+      final msg = (result['message'] ?? (ok ? 'Curățare finalizată.' : 'Eroare necunoscută.')).toString();
+      if (mounted) {
+        _closeSyncProgressDialogIfOpen();
+        await _showPersistentStatusDialog(
+          title: ok ? 'Curățare test finalizată' : 'Curățare test cu probleme',
+          message: msg,
+          isError: !ok,
+        );
+      }
+      if (ok) _fetchData();
+    } catch (e) {
+      if (mounted) {
+        _closeSyncProgressDialogIfOpen();
+        await _showPersistentStatusDialog(
+          title: 'Eroare curățare test',
+          message: '$e',
+          isError: true,
+        );
+      }
+    } finally {
+      _closeSyncProgressDialogIfOpen();
       if (mounted) setState(() => _isSyncing = false);
     }
   }
@@ -452,6 +596,12 @@ class _OrgEventsPageState extends State<OrgEventsPage> {
         elevation: 0,
         title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
         actions: [
+          if (!widget.personalMode && _userRole == UserRole.admin)
+            IconButton(
+              icon: const Icon(Icons.cleaning_services_outlined),
+              tooltip: 'Curățare test (săptămână + evenimente locale > 7 zile)',
+              onPressed: _cleanupTestWeek,
+            ),
           // Sync button
           _isSyncing
               ? const Padding(

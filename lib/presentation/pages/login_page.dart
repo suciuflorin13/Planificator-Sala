@@ -4,6 +4,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'home_page.dart';
 import 'register_page.dart';
 import '../theme.dart';
+import '../helpers/status_dialog_helper.dart';
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -47,8 +48,11 @@ class _LoginPageState extends State<LoginPage> {
       );
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Eroare: Email sau parolă greșită.')),
+        await StatusDialogHelper.show(
+          context,
+          title: 'Autentificare eșuată',
+          message: 'Eroare: Email sau parolă greșită.',
+          isError: true,
         );
       }
     } finally {
