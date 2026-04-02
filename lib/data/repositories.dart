@@ -381,6 +381,28 @@ class MessageRepository {
     await _db.from('messages').delete().eq('id', messageId);
   }
 
+  Future<void> deleteRequestMessageForReceiver({
+    required String receiverId,
+    required DateTime requestedStart,
+    required DateTime requestedEnd,
+    String? senderId,
+  }) async {
+    final body = _buildRequestMessageBody(requestedStart, requestedEnd);
+
+    var q = _db
+        .from('messages')
+        .delete()
+        .eq('receiver_id', receiverId)
+        .eq('title', 'Ai o cerere pentru un eveniment')
+        .eq('content', body);
+
+    if (senderId != null && senderId.trim().isNotEmpty) {
+      q = q.eq('sender_id', senderId.trim());
+    }
+
+    await q;
+  }
+
   Future<void> send({
     required String senderId,
     required String receiverId,
@@ -413,6 +435,21 @@ class MessageRepository {
       await _db.from('messages').insert(fallback);
     }
   }
+
+  static String _buildRequestMessageBody(DateTime requestedStart, DateTime requestedEnd) {
+    final month = _monthNames[requestedStart.month - 1];
+    return 'Ai o cerere pentru un eveniment din $month, '
+        'ziua ${requestedStart.day}, intervalul '
+        '${_fmtTime(requestedStart)}-${_fmtTime(requestedEnd)}.';
+  }
+
+  static String _fmtTime(DateTime dt) =>
+      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
+  static const _monthNames = [
+    'ianuarie', 'februarie', 'martie', 'aprilie', 'mai', 'iunie',
+    'iulie', 'august', 'septembrie', 'octombrie', 'noiembrie', 'decembrie',
+  ];
 }
 
 // ──────────────────────────────────────────────

@@ -98,8 +98,18 @@ class _MessagesPageState extends State<MessagesPage> {
   }
 
   Future<void> _deleteMessage(String id) async {
-    await _messageRepo.delete(id);
-    _loadMessages();
+    try {
+      await _messageRepo.delete(id);
+      await _loadMessages();
+    } catch (e) {
+      if (!mounted) return;
+      await StatusDialogHelper.show(
+        context,
+        title: 'Eroare ștergere mesaj',
+        message: '$e',
+        isError: true,
+      );
+    }
   }
 
   void _showMessageDetails(AppMessage msg, bool isInbox) {

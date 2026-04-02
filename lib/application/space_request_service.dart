@@ -9,14 +9,17 @@ class SpaceRequestService {
   final RequestRepository _requests;
   final EventRepository _events;
   final ScheduleRepository _schedule;
+  final MessageRepository _messages;
 
   SpaceRequestService({
     RequestRepository? requests,
     EventRepository? events,
     ScheduleRepository? schedule,
+    MessageRepository? messages,
   })  : _requests = requests ?? RequestRepository(),
         _events = events ?? EventRepository(),
-        _schedule = schedule ?? ScheduleRepository();
+        _schedule = schedule ?? ScheduleRepository(),
+        _messages = messages ?? MessageRepository();
 
   String get _currentUserId => Supabase.instance.client.auth.currentUser!.id;
 
@@ -33,6 +36,8 @@ class SpaceRequestService {
     } else {
       await _approveSingleRequest(request, ownership);
     }
+
+    await _deleteResolvedRequestMessage(request);
   }
 
   /// Reject a request.
@@ -239,6 +244,16 @@ class SpaceRequestService {
 
     // Delete the request
     await _requests.delete(request.id);
+  }
+
+  Future<void> _deleteResolvedRequestMessage(EventRequest request) async {
+    // Best effort cleanup: request approval should clear the corresponding inbox message.
+    await _messages.deleteRequestMessageForReceiver(
+      receiverId: _currentUserId,
+      requestedStart: request.requestedStart,
+      requestedEnd: request.requestedEnd,
+      senderId: request.createdBy,
+    );
   }
 
   Future<void> _segmentAllDayOnReject(
