@@ -42,6 +42,8 @@ type GoogleEventWindow = {
 
 const SYNC_FORWARD_DAYS = 60;
 const LOCAL_RETENTION_DAYS = 7;
+const DB_PAGE_SIZE = 500;
+const LINK_CHUNK_SIZE = 200;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -343,6 +345,24 @@ async function listGoogleEvents({
   timeMax: string;
 }): Promise<Array<Record<string, unknown>>> {
   const allItems: Array<Record<string, unknown>> = [];
+  for await (const item of streamGoogleEvents({ accessToken, calendarId, timeMin, timeMax })) {
+    allItems.push(item);
+  }
+
+  return allItems;
+}
+
+async function* streamGoogleEvents({
+  accessToken,
+  calendarId,
+  timeMin,
+  timeMax,
+}: {
+  accessToken: string;
+  calendarId: string;
+  timeMin: string;
+  timeMax: string;
+}): AsyncGenerator<Record<string, unknown>> {
   let pageToken: string | null = null;
 
   do {
@@ -371,11 +391,48 @@ async function listGoogleEvents({
       throw new Error(`Google events fetch failed: ${JSON.stringify(payload)}`);
     }
 
-    allItems.push(...(payload.items ?? []));
+    for (const item of payload.items ?? []) {
+      yield item;
+    }
+
     pageToken = payload.nextPageToken ?? null;
   } while (pageToken);
+}
 
-  return allItems;
+async function fetchAllPaged<T>({
+  buildQuery,
+  errorPrefix,
+}: {
+  buildQuery: () => any;
+  errorPrefix: string;
+}): Promise<T[]> {
+  const rows: T[] = [];
+  let from = 0;
+
+  while (true) {
+    const to = from + DB_PAGE_SIZE - 1;
+    const { data, error } = await buildQuery().order("id", { ascending: true }).range(from, to);
+    if (error) {
+      throw new Error(`${errorPrefix}: ${error.message}`);
+    }
+
+    const page = (data ?? []) as T[];
+    if (page.length === 0) break;
+    rows.push(...page);
+    if (page.length < DB_PAGE_SIZE) break;
+    from += DB_PAGE_SIZE;
+  }
+
+  return rows;
+}
+
+function splitIntoChunks<T>(values: T[], size: number): T[][] {
+  if (values.length === 0) return [];
+  const out: T[][] = [];
+  for (let i = 0; i < values.length; i += size) {
+    out.push(values.slice(i, i + size));
+  }
+  return out;
 }
 
 async function listGoogleCalendarIds({
@@ -1234,62 +1291,58 @@ Deno.serve(async (req: Request) => {
       const linked = await listGoogleCalendarIds({ accessToken });
       for (const id of linked) sourceCalendarIds.add(id);
 
-      const googleItemsWithCalendar: Array<{ item: Record<string, unknown>; calendarId: string }> = [];
-      for (const sourceCalendarId of sourceCalendarIds) {
-        const items = await listGoogleEvents({
-          accessToken,
-          calendarId: sourceCalendarId,
-          timeMin: syncWindowStart.toISOString(),
-          timeMax: syncWindowEnd.toISOString(),
-        });
-        for (const item of items) {
-          googleItemsWithCalendar.push({ item, calendarId: sourceCalendarId });
-        }
-      }
-      googleTotal = googleItemsWithCalendar.length;
+      const existingRows = await fetchAllPaged<{ id: string | null; source_external_id: string | null }>({
+        buildQuery: () => {
+          let q = supabase
+            .from("events")
+            .select("id, source_external_id")
+            .eq("source_provider", "google")
+            .eq("event_scope", scope);
 
-      let localQuery = supabase
-        .from("events")
-        .select("id, source_external_id")
-        .eq("source_provider", "google")
-        .eq("event_scope", scope);
+          if (scope === "organization") {
+            q = q.eq("organization_id", organizationId);
+          } else {
+            q = q.eq("owner_user_id", user.id);
+          }
 
-      if (scope === "organization") {
-        localQuery = localQuery.eq("organization_id", organizationId);
-      } else {
-        localQuery = localQuery.eq("owner_user_id", user.id);
-      }
-
-      const { data: existingRows, error: existingRowsError } = await localQuery;
-      if (existingRowsError) {
-        throw new Error(`Failed loading local events map: ${existingRowsError.message}`);
-      }
+          return q;
+        },
+        errorPrefix: "Failed loading local events map",
+      });
 
       // The dedupe map must only contain APP-managed events (not Google-imported ones).
       // Google events are matched exclusively by external ID; including them here would
       // incorrectly block re-import of events whose external ID format changed.
-      let dedupeQuery = supabase
-        .from("events")
-        .select("id, title, location, start_time, end_time")
-        .or("source_provider.is.null,source_provider.neq.google")
-        .gte("end_time", localRetentionCutoff.toISOString())
-        .lte("start_time", syncWindowEnd.toISOString());
+      const dedupeRows = await fetchAllPaged<{
+        id: string | null;
+        title: string | null;
+        location: string | null;
+        start_time: string | null;
+        end_time: string | null;
+      }>({
+        buildQuery: () => {
+          let q = supabase
+            .from("events")
+            .select("id, title, location, start_time, end_time")
+            .or("source_provider.is.null,source_provider.neq.google")
+            .gte("end_time", localRetentionCutoff.toISOString())
+            .lte("start_time", syncWindowEnd.toISOString());
 
-      if (scope === "organization") {
-        dedupeQuery = dedupeQuery.eq("organization_id", organizationId);
-      } else {
-        const userOrgId = (profile.organization_id ?? "").toString().trim();
-        if (userOrgId.length > 0) {
-          dedupeQuery = dedupeQuery.or(`owner_user_id.eq.${user.id},organization_id.eq.${userOrgId}`);
-        } else {
-          dedupeQuery = dedupeQuery.eq("owner_user_id", user.id);
-        }
-      }
+          if (scope === "organization") {
+            q = q.eq("organization_id", organizationId);
+          } else {
+            const userOrgId = (profile.organization_id ?? "").toString().trim();
+            if (userOrgId.length > 0) {
+              q = q.or(`owner_user_id.eq.${user.id},organization_id.eq.${userOrgId}`);
+            } else {
+              q = q.eq("owner_user_id", user.id);
+            }
+          }
 
-      const { data: dedupeRows, error: dedupeRowsError } = await dedupeQuery;
-      if (dedupeRowsError) {
-        throw new Error(`Failed loading local dedupe map: ${dedupeRowsError.message}`);
-      }
+          return q;
+        },
+        errorPrefix: "Failed loading local dedupe map",
+      });
 
       const localByExternalId = new Map<string, string>();
       for (const row of existingRows ?? []) {
@@ -1330,133 +1383,140 @@ Deno.serve(async (req: Request) => {
         }
       };
 
-      for (const packet of googleItemsWithCalendar) {
-        const item = packet.item;
-        const sourceCalendarId = packet.calendarId;
-        const rawExternalEventId = (item.id ?? "").toString().trim();
-        if (rawExternalEventId.length === 0) {
-          skipped += 1;
-          continue;
-        }
-        const externalEventId = `${sourceCalendarId}::${rawExternalEventId}`;
-        const status = (item.status ?? "confirmed").toString();
-        const localId = localByExternalId.get(externalEventId) ??
-          localByExternalId.get(rawExternalEventId);
+      for (const sourceCalendarId of sourceCalendarIds) {
+        for await (const item of streamGoogleEvents({
+          accessToken,
+          calendarId: sourceCalendarId,
+          timeMin: syncWindowStart.toISOString(),
+          timeMax: syncWindowEnd.toISOString(),
+        })) {
+          googleTotal += 1;
 
-        if (status === "cancelled") {
-          if (doDeletePropagation && localId) {
-            const { error: deleteError } = await supabase
+          const rawExternalEventId = (item.id ?? "").toString().trim();
+          if (rawExternalEventId.length === 0) {
+            skipped += 1;
+            continue;
+          }
+          const externalEventId = `${sourceCalendarId}::${rawExternalEventId}`;
+          const status = (item.status ?? "confirmed").toString();
+          const localId = localByExternalId.get(externalEventId) ??
+            localByExternalId.get(rawExternalEventId);
+
+          if (status === "cancelled") {
+            if (doDeletePropagation && localId) {
+              const { error: deleteError } = await supabase
+                .from("events")
+                .delete()
+                .eq("id", localId);
+              if (deleteError) {
+                throw new Error(
+                  `Failed deleting cancelled local event ${localId}: ${deleteError.message}`,
+                );
+              }
+              deleted += 1;
+            }
+            continue;
+          }
+
+          const window = parseGoogleEventWindow(item);
+          if (!window) {
+            skipped += 1;
+            continue;
+          }
+
+          const participants = resolveParticipantsFromGoogleItem(item, profileNameByEmail);
+          const title = (item.summary ?? "Eveniment Google").toString().trim();
+          const location = (item.location ?? "").toString().trim();
+          const description = extractDescription(item);
+          const fingerprint = buildGoogleFingerprint({
+            title,
+            location,
+            startIso: window.startIso,
+            endIso: window.endIso,
+          });
+
+          if (!localId && localByGoogleFingerprint.has(fingerprint)) {
+            deduplicated += 1;
+            skipped += 1;
+            continue;
+          }
+
+          const eventPayload = {
+            title: title.length > 0 ? title : "Eveniment Google",
+            event_type: "Google",
+            location,
+            description,
+            google_description: description,
+            participants,
+            start_time: window.startIso,
+            end_time: window.endIso,
+            source_all_day: window.isAllDay,
+            event_scope: scope,
+            owner_user_id: scope === "personal" ? user.id : null,
+            organization_id: scope === "organization" ? organizationId : profile.organization_id,
+            created_by: user.id,
+            source_provider: "google",
+            source_external_id: externalEventId,
+            synced_at: new Date().toISOString(),
+          };
+
+          let resolvedLocalId = localId ?? "";
+          if (resolvedLocalId.length > 0) {
+            const { error: updateError } = await supabase
               .from("events")
-              .delete()
-              .eq("id", localId);
-            if (deleteError) {
-              throw new Error(
-                `Failed deleting cancelled local event ${localId}: ${deleteError.message}`,
-              );
+              .update(eventPayload)
+              .eq("id", resolvedLocalId);
+
+            if (updateError) {
+              if (isOverlapConstraintError(updateError.message)) {
+                rememberConflict(externalEventId, title);
+                continue;
+              }
+              throw new Error(`Failed updating local event ${resolvedLocalId}: ${updateError.message}`);
             }
-            deleted += 1;
-          }
-          continue;
-        }
+            updated += 1;
+          } else {
+            const { data: inserted, error: insertError } = await supabase
+              .from("events")
+              .insert(eventPayload)
+              .select("id")
+              .single();
 
-        const window = parseGoogleEventWindow(item);
-        if (!window) {
-          skipped += 1;
-          continue;
-        }
-
-        const participants = resolveParticipantsFromGoogleItem(item, profileNameByEmail);
-        const title = (item.summary ?? "Eveniment Google").toString().trim();
-        const location = (item.location ?? "").toString().trim();
-        const description = extractDescription(item);
-        const fingerprint = buildGoogleFingerprint({
-          title,
-          location,
-          startIso: window.startIso,
-          endIso: window.endIso,
-        });
-
-        if (!localId && localByGoogleFingerprint.has(fingerprint)) {
-          deduplicated += 1;
-          skipped += 1;
-          continue;
-        }
-
-        const eventPayload = {
-          title: title.length > 0 ? title : "Eveniment Google",
-          event_type: "Google",
-          location,
-          description,
-          google_description: description,
-          participants,
-          start_time: window.startIso,
-          end_time: window.endIso,
-          source_all_day: window.isAllDay,
-          event_scope: scope,
-          owner_user_id: scope === "personal" ? user.id : null,
-          organization_id: scope === "organization" ? organizationId : profile.organization_id,
-          created_by: user.id,
-          source_provider: "google",
-          source_external_id: externalEventId,
-          synced_at: new Date().toISOString(),
-        };
-
-        let resolvedLocalId = localId ?? "";
-        if (resolvedLocalId.length > 0) {
-          const { error: updateError } = await supabase
-            .from("events")
-            .update(eventPayload)
-            .eq("id", resolvedLocalId);
-
-          if (updateError) {
-            if (isOverlapConstraintError(updateError.message)) {
-              rememberConflict(externalEventId, title);
-              continue;
+            if (insertError || !inserted?.id) {
+              if (insertError && isOverlapConstraintError(insertError.message)) {
+                rememberConflict(externalEventId, title);
+                continue;
+              }
+              throw new Error(`Failed inserting local event for ${externalEventId}: ${insertError?.message ?? "missing id"}`);
             }
-            throw new Error(`Failed updating local event ${resolvedLocalId}: ${updateError.message}`);
+            resolvedLocalId = inserted.id.toString();
+            localByExternalId.set(externalEventId, resolvedLocalId);
+            localByExternalId.set(rawExternalEventId, resolvedLocalId);
+            localByGoogleFingerprint.set(fingerprint, resolvedLocalId);
+            created += 1;
           }
-          updated += 1;
-        } else {
-          const { data: inserted, error: insertError } = await supabase
-            .from("events")
-            .insert(eventPayload)
-            .select("id")
-            .single();
 
-          if (insertError || !inserted?.id) {
-            if (insertError && isOverlapConstraintError(insertError.message)) {
-              rememberConflict(externalEventId, title);
-              continue;
-            }
-            throw new Error(`Failed inserting local event for ${externalEventId}: ${insertError?.message ?? "missing id"}`);
+          const linkPayload = {
+            local_event_id: resolvedLocalId,
+            provider: "google",
+            external_event_id: externalEventId,
+            sync_scope: scope,
+            owner_organization_id: scope === "organization" ? organizationId : null,
+            owner_user_id: scope === "personal" ? user.id : null,
+            external_etag: (item.etag ?? null) as string | null,
+            external_updated_at: (item.updated ?? null) as string | null,
+            deleted_in_external: false,
+            deleted_in_local: false,
+            last_seen_at: new Date().toISOString(),
+          };
+
+          const { error: linkError } = await supabase
+            .from("external_event_links")
+            .upsert(linkPayload, { onConflict: "provider,external_event_id,sync_scope" });
+
+          if (linkError) {
+            throw new Error(`Failed upserting external link for ${externalEventId}: ${linkError.message}`);
           }
-          resolvedLocalId = inserted.id.toString();
-          localByExternalId.set(externalEventId, resolvedLocalId);
-          localByExternalId.set(rawExternalEventId, resolvedLocalId);
-          localByGoogleFingerprint.set(fingerprint, resolvedLocalId);
-          created += 1;
-        }
-
-        const linkPayload = {
-          local_event_id: resolvedLocalId,
-          provider: "google",
-          external_event_id: externalEventId,
-          sync_scope: scope,
-          owner_organization_id: scope === "organization" ? organizationId : null,
-          owner_user_id: scope === "personal" ? user.id : null,
-          external_etag: (item.etag ?? null) as string | null,
-          external_updated_at: (item.updated ?? null) as string | null,
-          deleted_in_external: false,
-          deleted_in_local: false,
-          last_seen_at: new Date().toISOString(),
-        };
-
-        const { error: linkError } = await supabase
-          .from("external_event_links")
-          .upsert(linkPayload, { onConflict: "provider,external_event_id,sync_scope" });
-
-        if (linkError) {
-          throw new Error(`Failed upserting external link for ${externalEventId}: ${linkError.message}`);
         }
       }
     }
@@ -1471,15 +1531,13 @@ Deno.serve(async (req: Request) => {
         updated: string | null;
       };
 
-      const googleEventsForPush = await listGoogleEvents({
+      const googleByFingerprint = new Map<string, GoogleEventEntry>();
+      for await (const item of streamGoogleEvents({
         accessToken,
         calendarId,
         timeMin: syncWindowStart.toISOString(),
         timeMax: syncWindowEnd.toISOString(),
-      });
-
-      const googleByFingerprint = new Map<string, GoogleEventEntry>();
-      for (const item of googleEventsForPush) {
+      })) {
         if ((item.status ?? "").toString() === "cancelled") continue;
         const id = (item.id ?? "").toString().trim();
         if (!id) continue;
@@ -1498,50 +1556,50 @@ Deno.serve(async (req: Request) => {
       }
 
       // Load app-managed events in the sync window (excludes Google-sourced).
-      let localEventsQuery = supabase
-        .from("events")
-        .select("id, title, event_type, location, description, participants, start_time, end_time, source_all_day, source_provider, updated_at")
-        .eq("event_scope", scope)
-        .gte("end_time", syncWindowStart.toISOString())
-        .lte("start_time", syncWindowEnd.toISOString());
-
-      if (scope === "organization") {
-        localEventsQuery = localEventsQuery.eq("organization_id", organizationId);
-      } else {
-        localEventsQuery = localEventsQuery.eq("owner_user_id", user.id);
-      }
-
-      const { data: localEvents, error: localEventsError } = await localEventsQuery;
-      if (localEventsError) {
-        throw new Error(`Failed loading local events for push: ${localEventsError.message}`);
-      }
-
-      const localEventIds = (localEvents ?? [])
-        .map((e) => (e.id ?? "").toString())
-        .filter(Boolean);
-
       type PushLink = {
         local_event_id: string;
         external_event_id: string;
         external_updated_at: string | null;
       };
-      let existingPushLinks: PushLink[] = [];
-      if (localEventIds.length > 0) {
+      const localEvents = await fetchAllPaged<any>({
+        buildQuery: () => {
+          let q = supabase
+            .from("events")
+            .select("id, title, event_type, location, description, participants, start_time, end_time, source_all_day, source_provider, updated_at")
+            .eq("event_scope", scope)
+            .gte("end_time", syncWindowStart.toISOString())
+            .lte("start_time", syncWindowEnd.toISOString());
+
+          if (scope === "organization") {
+            q = q.eq("organization_id", organizationId);
+          } else {
+            q = q.eq("owner_user_id", user.id);
+          }
+
+          return q;
+        },
+        errorPrefix: "Failed loading local events for push",
+      });
+
+      const pushLinkByLocalId = new Map<string, PushLink>();
+      const localEventIds = localEvents
+        .map((e) => (e.id ?? "").toString())
+        .filter(Boolean);
+      for (const idChunk of splitIntoChunks(localEventIds, LINK_CHUNK_SIZE)) {
         const { data: linksData, error: linksError } = await supabase
           .from("external_event_links")
           .select("local_event_id, external_event_id, external_updated_at")
-          .in("local_event_id", localEventIds)
+          .in("local_event_id", idChunk)
           .eq("provider", "google")
           .eq("sync_scope", scope);
         if (linksError) {
           throw new Error(`Failed loading push links: ${linksError.message}`);
         }
-        existingPushLinks = (linksData ?? []) as PushLink[];
+        for (const link of (linksData ?? []) as PushLink[]) {
+          const key = (link.local_event_id ?? "").toString();
+          if (key) pushLinkByLocalId.set(key, link);
+        }
       }
-
-      const pushLinkByLocalId = new Map<string, PushLink>(
-        existingPushLinks.map((l) => [l.local_event_id.toString(), l]),
-      );
 
       const seenLocalTypeTitleLocation = new Set<string>();
 
